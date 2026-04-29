@@ -1,0 +1,130 @@
+name: Build ddk
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: '内核分支（如 android16-6.12-2025-06）'
+        required: true
+      clang_version:
+        description: 'Clang 版本（如 clang-r536225）'
+        required: true
+      rust_version:
+        description: 'Rust 版本（如 rust-1.82.0）'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+
+    - name: Maximize build space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
+
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        repository: Ylarod/ddk
+        ref: main
+        submodules: false
+
+    - name: Configure mapping.json
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const mapping = JSON.parse(fs.readFileSync('mapping.json', 'utf8'));
+          const kernelBranch = '${{ inputs.kernel_branch }}';
+          mapping.matrix = [{ android: kernelBranch, clang: '${{ inputs.clang_version }}', rust: '${{ inputs.rust_version }}' || null }];
+          mapping.android = [{ name: kernelBranch, branch: kernelBranch }];
+          fs.writeFileSync('mapping.json', JSON.stringify(mapping, null, 2));
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update && sudo apt-get install -y \
+          git git-lfs wget curl ca-certificates tar xz-utils \
+          build-essential bc bison flex python3 clang lld \
+          libelf-dev libssl-dev libdw-dev cpio \
+          rsync device-tree-compiler cmake \
+          lz4 zstd libncurses-dev bash jq \
+          binutils-aarch64-linux-gnu file ccache \
+          openssl libudev-dev libpciaccess-dev libiberty-dev \
+          zlib1g-dev libc6-dev-i386 lib32z1-dev \
+          libx11-dev libgl1-mesa-dev \
+          libxml2-utils xsltproc libbpf-dev llvm
+        git clone --depth 1 https://git.kernel.org/pub/scm/devel/pahole/pahole.git
+        mkdir -p pahole/build
+        cd pahole/build
+        cmake -D__LIB=lib ..
+        make -j$(nproc)
+        sudo make install
+        sudo ldconfig
+
+    - name: Download toolchains
+      run: |
+        python3 build/build-ddk.py setup-toolchain --android ${{ inputs.kernel_branch }} --source download
+
+    - name: Setup kernel source
+      run: |
+        python3 build/build-ddk.py setup-src --android ${{ inputs.kernel_branch }} --source download
+
+    - name: Build kernel
+      run: |
+        python3 build/build-ddk.py build --android ${{ inputs.kernel_branch }} --lto none -j 4 --min
+
+    - name: Prepare docker build context
+      run: |
+        mkdir -p prebuilts/clang prebuilts/rust prebuilts/src prebuilts/kdir prebuilts/kdir-min
+        tar -I zstd -cf prebuilts/clang/${{ inputs.clang_version }}.tar.zst -C /opt/ddk/clang ${{ inputs.clang_version }}
+        if [ -n "${{ inputs.rust_version }}" ]; then
+          tar -I zstd -cf prebuilts/rust/${{ inputs.rust_version }}.tar.zst -C /opt/ddk/rust ${{ inputs.rust_version }}
+        fi
+        tar -I zstd -cf prebuilts/src/src.${{ inputs.kernel_branch }}.tar.zst -C /opt/ddk/src ${{ inputs.kernel_branch }}
+        tar -I zstd -cf prebuilts/kdir/kdir.${{ inputs.kernel_branch }}.tar.zst -C /opt/ddk/kdir-full ${{ inputs.kernel_branch }}
+        tar -I zstd -cf prebuilts/kdir-min/kdir.${{ inputs.kernel_branch }}.tar.zst -C /opt/ddk/kdir ${{ inputs.kernel_branch }}
+        REG="ghcr.io/${{ github.actor }}/ddk"
+        sed -i "s|docker.cnb.cool/ylarod/ddk|${REG}|g" docker/ddk-builder/Dockerfile docker/ddk/Dockerfile docker/ddk-min/Dockerfile docker/ddk-toolchain/Dockerfile
+
+    - name: Login to GHCR
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Build ddk-builder image
+      env:
+        REG: ghcr.io/${{ github.actor }}/ddk
+      run: |
+        cd docker
+        make builder PUSH=1 REG=${REG}
+
+    - name: Build toolchain image
+      env:
+        REG: ghcr.io/${{ github.actor }}/ddk
+      run: |
+        cd docker
+        make toolchains VER=${{ inputs.kernel_branch }} PUSH=1 REG=${REG} CLANG_VER=${{ inputs.clang_version }} RUST_VER=${{ inputs.rust_version }}
+
+    - name: Build ddk image
+      env:
+        REG: ghcr.io/${{ github.actor }}/ddk
+      run: |
+        cd docker
+        make build VER=${{ inputs.kernel_branch }} PUSH=1 REG=${REG}
+
+    - name: Build ddk-min image
+      env:
+        REG: ghcr.io/${{ github.actor }}/ddk
+      run: |
+        cd docker
+        make build-min VER=${{ inputs.kernel_branch }} PUSH=1 REG=${REG}
